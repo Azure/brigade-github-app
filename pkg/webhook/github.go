@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/google/go-github/github"
-	gin "gopkg.in/gin-gonic/gin.v1"
+	"gopkg.in/gin-gonic/gin.v1"
 
 	"github.com/brigadecore/brigade/pkg/brigade"
 	"github.com/brigadecore/brigade/pkg/storage"
@@ -33,6 +33,8 @@ type githubHook struct {
 	allowedAuthors          []string
 	// key is the x509 certificate key as ASCII-armored (PEM) data
 	key []byte
+	// buildReporter is used for reporting build failures via issue comments
+	buildReporter *BuildReporter
 }
 
 // GithubOpts provides options for configuring a GitHub hook
@@ -42,18 +44,20 @@ type GithubOpts struct {
 	AppID               int
 	DefaultSharedSecret string
 	EmittedEvents       []string
+	ReportBuildFailures bool
 }
 
 type iceUpdater func(c *gin.Context, s *githubHook, ice *github.IssueCommentEvent, rev brigade.Revision, proj *brigade.Project, body []byte) (brigade.Revision, []byte)
 
 // NewGithubHookHandler creates a GitHub webhook handler.
-func NewGithubHookHandler(s storage.Store, authors []string, x509Key []byte, opts GithubOpts) gin.HandlerFunc {
+func NewGithubHookHandler(s storage.Store, authors []string, x509Key []byte, reporter *BuildReporter, opts GithubOpts) gin.HandlerFunc {
 	gh := &githubHook{
 		store:                   s,
 		updateIssueCommentEvent: updateIssueCommentEvent,
 		allowedAuthors:          authors,
 		key:                     x509Key,
 		opts:                    opts,
+		buildReporter:           reporter,
 	}
 	return gh.Handle
 }
@@ -207,7 +211,12 @@ func (s *githubHook) handleEvent(
 		// TODO: do we return here (e.g. stop the PR hook) if we get to this point
 	}
 
-	s.scheduleBuild(eventType, action, rev, body, proj)
+	opts, err := s.preToBuildOpts(pre, proj)
+	if err != nil {
+		log.Printf("error constructing build opts from pull request event: %v", err)
+	}
+
+	s.scheduleBuild(eventType, action, rev, body, proj, opts)
 
 	c.JSON(http.StatusOK, gin.H{"status": "Complete"})
 }
@@ -289,7 +298,7 @@ func (s *githubHook) handleCheck(
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "JSON encoding error"})
 	}
 
-	s.scheduleBuild(eventType, action, rev, payload, proj)
+	s.scheduleBuild(eventType, action, rev, payload, proj, s.checkEventToBuildOpts(event, tok))
 
 	c.JSON(http.StatusOK, gin.H{"status": "Complete"})
 }
@@ -355,7 +364,12 @@ func (s *githubHook) handleIssueComment(
 		rev.Ref = "refs/heads/master"
 	}
 
-	s.scheduleBuild(eventType, action, rev, payload, proj)
+	opts, err := s.icePayloadToBuildOpts(ice, proj, payload)
+	if err != nil {
+		log.Printf("error constructing build opts from issue comment event: %v", err)
+	}
+
+	s.scheduleBuild(eventType, action, rev, payload, proj, opts)
 
 	c.JSON(http.StatusOK, gin.H{"status": "Complete"})
 }
@@ -369,7 +383,7 @@ func updateIssueCommentEvent(c *gin.Context, s *githubHook, ice *github.IssueCom
 	appID := s.opts.AppID
 	instID := ice.Installation.GetID()
 
-	tok, timeout, err := s.getInstallationToken(appID, int(instID), proj)
+	tok, timeout, err := s.iceToIntsallationToken(ice, proj)
 	if err != nil {
 		log.Printf("Failed to negotiate a token: %s", err)
 		c.JSON(http.StatusForbidden, gin.H{"status": ErrAuthFailed})
@@ -399,7 +413,7 @@ func updateIssueCommentEvent(c *gin.Context, s *githubHook, ice *github.IssueCom
 		InstID:       int(instID),
 		Type:         "issue_comment",
 		Token:        tok,
-		TokenExpires: timeout,
+		TokenExpires: *timeout,
 		Commit:       rev.Commit,
 		Branch:       rev.Ref,
 	}
@@ -461,12 +475,12 @@ func marshalWithGithubPayload(res *Payload, body []byte) ([]byte, error) {
 
 // scheduleBuild schedules a Brigade build both for the raw eventType
 // and for each action of the event, when applicable
-func (s *githubHook) scheduleBuild(eventType, action string, rev brigade.Revision, payload []byte, proj *brigade.Project) {
+func (s *githubHook) scheduleBuild(eventType, action string, rev brigade.Revision, payload []byte, proj *brigade.Project, opts buildOpts) {
 	// Schedule a build using the raw eventType
-	s.build(eventType, rev, payload, proj)
+	s.build(eventType, rev, payload, proj, opts)
 	// For events that have an action, schedule a second build for eventType:action
 	if action != "" {
-		s.build(fmt.Sprintf("%s:%s", eventType, action), rev, payload, proj)
+		s.build(fmt.Sprintf("%s:%s", eventType, action), rev, payload, proj, opts)
 	}
 }
 
@@ -532,10 +546,8 @@ func (s *githubHook) prToCheckSuite(c *gin.Context, pre *github.PullRequestEvent
 	repo := pre.Repo.GetFullName()
 	ref := fmt.Sprintf("refs/pull/%d/head", pre.PullRequest.GetNumber())
 	sha := pre.PullRequest.Head.GetSHA()
-	appID := s.opts.AppID
-	instID := pre.Installation.GetID()
 
-	tok, _, err := s.getInstallationToken(appID, int(instID), proj)
+	tok, _, err := s.prToInstallationToken(pre, proj)
 	if err != nil {
 		log.Printf("Failed to negotiate a token: %s", err)
 		return ErrAuthFailed
@@ -635,9 +647,23 @@ func (s *githubHook) shouldEmit(eventType string) bool {
 }
 
 // build creates a new brigade.Build using the info provided
-func (s *githubHook) build(eventType string, rev brigade.Revision, payload []byte, proj *brigade.Project) error {
+//
+// When a non-empty installation token is present and the --report-build-failures is set,
+// it starts watching the build asynchronously and report back with a GitHub issue/pr comment
+func (s *githubHook) build(eventType string, rev brigade.Revision, payload []byte, proj *brigade.Project, opts buildOpts) error {
+	b, err := s.doBuild(eventType, rev, payload, proj)
+	if err != nil {
+		return err
+	}
+	if opts.tok != "" && opts.issueID != 0 && s.opts.ReportBuildFailures {
+		s.buildReporter.Add(b, opts.issueID, opts.tok)
+	}
+	return nil
+}
+
+func (s *githubHook) doBuild(eventType string, rev brigade.Revision, payload []byte, proj *brigade.Project) (*brigade.Build, error) {
 	if !s.shouldEmit(eventType) {
-		return nil
+		return nil, nil
 	}
 	b := &brigade.Build{
 		ProjectID: proj.ID,
@@ -646,7 +672,8 @@ func (s *githubHook) build(eventType string, rev brigade.Revision, payload []byt
 		Revision:  &rev,
 		Payload:   payload,
 	}
-	return s.store.CreateBuild(b)
+	err := s.store.CreateBuild(b)
+	return b, err
 }
 
 // validateSignature compares the salted digest in the header with our own computing of the body.
